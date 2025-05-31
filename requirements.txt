@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+aiohttp
+jinja2
+boto3
+pdfkit
+python-dotenv
+langchain
+pydantic
+markdown2
+weasyprint
