@@ -5,6 +5,7 @@ import re
 import boto3
 import markdown2
 import json
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -15,6 +16,54 @@ from weasyprint import HTML
 
 import aiohttp
 import asyncio
+
+# ===== JSON 로깅 설정 추가 =====
+def setup_json_logging():
+    """JSON 형태로 로그를 파일에 기록하는 핸들러 설정 (ELK 스택 연동)"""
+    
+    # 로그 디렉토리 확인/생성
+    log_dir = "/var/logs/report_generator"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # JSON 포맷터 클래스
+    class JsonFormatter(logging.Formatter):
+        def format(self, record):
+            log_entry = {
+                "@timestamp": datetime.utcnow().isoformat() + "Z",
+                "level": record.levelname,
+                "service": "server3-report",
+                "message": record.getMessage(),
+                "module": record.module,
+                "function": record.funcName,
+                "line": record.lineno,
+                "logger": record.name
+            }
+            
+            # 예외 정보가 있으면 추가
+            if record.exc_info:
+                log_entry["exception"] = self.formatException(record.exc_info)
+            
+            # 추가 필드가 있으면 포함
+            if hasattr(record, 'extra_fields'):
+                log_entry.update(record.extra_fields)
+            
+            return json.dumps(log_entry, ensure_ascii=False)
+    
+    # 파일 핸들러 생성
+    log_file_path = f"{log_dir}/report_generator.log"
+    file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+    file_handler.setFormatter(JsonFormatter())
+    file_handler.setLevel(logging.INFO)
+    
+    # 루트 로거에 핸들러 추가
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+    
+    print(f"✅ JSON logging setup completed: {log_file_path}")
+    return log_file_path
+
+# JSON 로깅 설정 (앱 생성 전에 실행)
+log_file_path = setup_json_logging()
 
 # ===== Prometheus 메트릭 추가 =====
 from prometheus_client import Counter, Histogram, Gauge
@@ -32,12 +81,21 @@ team5_pdf_generation_duration = Histogram('team5_pdf_generation_seconds', 'PDF g
 team5_s3_upload_duration = Histogram('team5_s3_upload_seconds', 'S3 upload duration', ['service'])
 team5_report_processing_duration = Histogram('team5_report_processing_seconds', 'Total report processing time', ['service'])
 
-# ----- 기존 로그 설정 (변경 없음) -----
+# ----- 기존 로그 설정 (JSON 로그와 함께 사용) -----
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger("meeting-summary")
+
+# 로그 시작 메시지
+logger.info("Server3-Report starting with JSON logging enabled", extra={
+    'extra_fields': {
+        'event': 'service_startup',
+        'log_file': log_file_path,
+        'version': '2.7'
+    }
+})
 
 # ----- 기존 환경변수 로드 및 체크 (변경 없음) -----
 load_dotenv()
@@ -221,7 +279,12 @@ async def report_json(request: MeetingInput):
     
     try:
         t0 = time.perf_counter()
-        logger.info("요약 요청 수신")
+        logger.info("요약 요청 수신", extra={
+            'extra_fields': {
+                'event': 'report_request_received',
+                'text_length': len(request.text_stt)
+            }
+        })
 
         # Step 1. 텍스트 분할 (기존 로직 동일)
         t_split_start = time.perf_counter()
@@ -356,7 +419,13 @@ async def report_json(request: MeetingInput):
             api_time = t_api_end - t_api_start
             total_time = t_api_end - t0
             logger.info(f"[STEP 7] 문서등록API 호출 완료 (소요={api_time:.2f}s, 누적={t_api_end-t0:.2f}s)")
-            logger.info(f"[전체] 총 소요시간: {total_time:.2f}s")
+            logger.info(f"[전체] 총 소요시간: {total_time:.2f}s", extra={
+                'extra_fields': {
+                    'event': 'report_completed',
+                    'total_time': total_time,
+                    'pdf_doc_id': pdf_doc_id
+                }
+            })
 
             # 메트릭: 전체 처리 시간 기록
             team5_report_processing_duration.labels(service="server3-report").observe(total_time)
@@ -372,7 +441,12 @@ async def report_json(request: MeetingInput):
         raise
     except Exception as e:
         team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
-        logger.exception("알 수 없는 서버 오류")
+        logger.exception("알 수 없는 서버 오류", extra={
+            'extra_fields': {
+                'event': 'unexpected_error',
+                'error_type': type(e).__name__
+            }
+        })
         raise HTTPException(status_code=500, detail=f"처리 중 알 수 없는 오류: {e}")
     finally:
         # 메트릭: 활성 요청 수 감소
@@ -380,11 +454,22 @@ async def report_json(request: MeetingInput):
 
 @app.get("/")
 def root():
-    return {"message": "회의 요약 PDF API 작동 중"}
+    logger.info("Root endpoint accessed", extra={
+        'extra_fields': {
+            'event': 'root_endpoint_access',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    })
+    return {"message": "회의 요약 PDF API 작동 중", "version": "2.7", "logging": "enabled"}
 
 # 추가: 헬스체크 엔드포인트
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "2.7"}
+    return {
+        "status": "healthy", 
+        "version": "2.7", 
+        "logging": "json_enabled",
+        "log_file": log_file_path
+    }
 
 # 추가: /metrics 엔드포인트는 Instrumentator가 자동 생성

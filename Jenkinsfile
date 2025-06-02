@@ -35,15 +35,11 @@ pipeline {
             fi
           done
           
-          # 기존 로그 디렉토리 상태 확인 (sudo 없이)
-          if [ -d "/var/logs/report_generator" ]; then
-            echo "Log directory already exists"
-            ls -la /var/logs/report_generator/ || echo "Directory exists but cannot list"
-          else
-            echo "Log directory does not exist - will be created by container"
-          fi
+          # 로그 디렉토리 생성 (Host에서)
+          sudo mkdir -p /var/logs/report_generator
+          sudo chmod 755 /var/logs/report_generator
           
-          # 새 컨테이너 실행 (기존 경로 그대로 유지!)
+          # 새 컨테이너 실행 (Filebeat 호환 경로로 볼륨 마운트)
           docker run -d \\
             --name "${IMAGE_NAME}" \\
             --network team5-net \\
@@ -59,7 +55,7 @@ pipeline {
             -e HOSTNAME="${IMAGE_NAME}" \\
             "${IMAGE_NAME}:${IMAGE_TAG}"
             
-          echo "Container started with existing log directory mount"
+          echo "✅ Container started with log directory mount for Filebeat"
         '''
       }
     }
@@ -101,41 +97,66 @@ pipeline {
             echo "⚠️ Metrics endpoint not available"
           fi
           
-          # 로그 파일 생성 확인 (기존 경로)
+          # JSON 로그 파일 생성 확인
+          sleep 5  # 로그 파일 생성 대기
           if [ -f "/var/logs/report_generator/report_generator.log" ]; then
-            echo "📝 Log file is accessible"
+            echo "📝 JSON log file created successfully"
             echo "Log file size: $(du -h /var/logs/report_generator/report_generator.log 2>/dev/null || echo 'Cannot check size')"
+            echo "Recent log entries:"
+            tail -3 /var/logs/report_generator/report_generator.log || echo "Cannot read log file"
           else
-            echo "⚠️ Log file not found at expected location"
+            echo "⚠️ JSON log file not found at expected location"
           fi
         '''
       }
     }
         
-    stage('Integration Test') {
+    stage('ELK Integration Test') {
       steps {
         sh '''
-          echo "Running integration tests..."
+          echo "Testing ELK Stack Integration..."
           
-          # 컨테이너 네트워크 연결 확인
-          docker network inspect team5-net | grep ${IMAGE_NAME} && echo "✅ Connected to team5-net" || echo "⚠️ Network connection issue"
-          
-          # 컨테이너 내부에서 로그 디렉토리 확인
-          docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ && echo "✅ Log directory accessible from container" || echo "⚠️ Log directory issue"
-          
-          # Prometheus 메트릭 확인 (team5-prom 컨테이너가 존재하는 경우)
-          if docker ps | grep team5-prom; then
-            echo "Checking Prometheus metrics..."
-            docker exec team5-prom wget -qO- http://${IMAGE_NAME}:8377/metrics | head -5 && echo "✅ Prometheus can scrape metrics" || echo "⚠️ Prometheus scraping issue"
-          else
-            echo "⚠️ team5-prom container not found, skipping metrics test"
-          fi
-          
-          # 기존 Filebeat 연동 확인
+          # Filebeat 컨테이너 확인
           if docker ps | grep filebeat; then
-            echo "✅ Filebeat container is running - log collection should work"
+            echo "✅ Filebeat container is running"
+            
+            # 로그 파일이 Filebeat 경로에 있는지 확인
+            if [ -f "/var/logs/report_generator/report_generator.log" ]; then
+              echo "✅ Log file accessible to Filebeat"
+              
+              # JSON 로그 형식 확인
+              if head -1 /var/logs/report_generator/report_generator.log | python3 -m json.tool > /dev/null 2>&1; then
+                echo "✅ Log file is in valid JSON format"
+              else
+                echo "⚠️ Log file may not be in valid JSON format"
+              fi
+            else
+              echo "❌ Log file not found for Filebeat"
+            fi
           else
             echo "⚠️ Filebeat container not found"
+          fi
+          
+          # Prometheus 메트릭 확인
+          if docker ps | grep team5-prom; then
+            echo "✅ Team5-Prometheus container is running"
+            
+            # 메트릭 스크래핑 테스트
+            if docker exec team5-prom wget -qO- http://${IMAGE_NAME}:8377/metrics | grep "team5_report" > /dev/null; then
+              echo "✅ Prometheus can scrape Team5 report metrics"
+            else
+              echo "⚠️ Prometheus metrics may not be accessible"
+            fi
+          else
+            echo "⚠️ team5-prom container not found"
+          fi
+          
+          # Grafana 대시보드 확인
+          if docker ps | grep team5-grafana; then
+            echo "✅ Team5-Grafana container is running"
+            echo "🎯 Import server3_6.json dashboard to view metrics"
+          else
+            echo "⚠️ team5-grafana container not found"
           fi
         '''
       }
@@ -157,32 +178,24 @@ pipeline {
   post {
     always {
       echo "Build #${env.BUILD_NUMBER} finished at ${new Date()}"
-      // 기존 로그 디렉토리 상태 확인
       sh '''
-        echo "=== Final Container Status ==="
+        echo "=== Final Status Check ==="
+        echo "Container Status:"
         docker ps | grep ${IMAGE_NAME} || echo "Container not found"
-        echo "=== Log Directory Status (Host) ==="
-        ls -la /var/logs/report_generator/ || echo "Log directory not accessible from host"
-        echo "=== Log Directory Status (Container) ==="
-        docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ || echo "Log directory not accessible from container"
-        echo "=== Container Logs (last 20 lines) ==="
-        docker logs --tail 20 ${IMAGE_NAME} || echo "No container logs available"
+        echo "Log Directory Status:"
+        ls -la /var/logs/report_generator/ || echo "Log directory not accessible"
+        echo "Recent Container Logs:"
+        docker logs --tail 10 ${IMAGE_NAME} || echo "No container logs available"
       '''
     }
     success {
       echo "✅ Server3 Report Generator deployed successfully!"
       echo "🔗 Service URL: http://localhost:8377"
       echo "📊 Metrics URL: http://localhost:8377/metrics"
-      echo "📝 Logs: /var/logs/report_generator/ (기존 Filebeat 경로 유지)"
+      echo "📝 JSON Logs: /var/logs/report_generator/report_generator.log"
+      echo "🔍 Kibana: Check 'report-generator-logs-*' index"
+      echo "📈 Grafana: Import server3_6.json dashboard"
       echo "🐳 Container: ${IMAGE_NAME}:${IMAGE_TAG}"
-      // 성공 알림을 위한 간단한 API 테스트
-      sh '''
-        echo "=== Final API Test ==="
-        curl -s http://localhost:8377/ | jq . || echo "API response received"
-        echo "=== Log Collection Verification ==="
-        echo "Checking if logs are being written..."
-        docker exec ${IMAGE_NAME} tail -5 /var/logs/report_generator/report_generator.log || echo "Cannot read recent logs"
-      '''
     }
     failure {
       echo "❌ Deployment failed"
@@ -190,13 +203,13 @@ pipeline {
         echo "=== Failure Analysis ==="
         echo "Container Logs:"
         docker logs ${IMAGE_NAME} || echo "No container logs available"
-        echo "=== Container Status ==="
+        echo "Container Status:"
         docker ps -a | grep ${IMAGE_NAME} || echo "Container not found"
-        echo "=== Network Status ==="
+        echo "Network Status:"
         docker network inspect team5-net | grep ${IMAGE_NAME} || echo "Not in team5-net"
-        echo "=== Port Status ==="
+        echo "Port Status:"
         netstat -tlnp | grep 8377 || echo "Port 8377 not listening"
-        echo "=== Log Directory Permissions ==="
+        echo "Log Directory Permissions:"
         ls -la /var/logs/ | grep report_generator || echo "Cannot check log directory permissions"
       '''
     }
