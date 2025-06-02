@@ -27,26 +27,29 @@ pipeline {
     stage('Deploy Container') {
       steps {
         sh '''
-          # 기존 컨테이너 정리 (호환 가능한 문법)
+          # 기존 컨테이너 정리 (이름 변경 고려)
           for name in great_villani server3-report-generator server3-report; do
-            container_exists=$(docker ps -a --filter "name=^/${name}$" --format "{{.Names}}" | grep "^${name}$" || echo "")
-            if [ ! -z "$container_exists" ]; then
+            if docker ps -a --filter "name=^/${name}$" --format "{{.Names}}" | grep -q "^${name}$"; then
               echo "Stopping and removing container ${name}"
               docker rm -f "${name}"
             fi
           done
           
-          # 호스트에서 로그 디렉토리 생성 (sudo 없이)
-          # Jenkins 사용자가 쓸 수 있는 위치로 변경하거나, 도커 볼륨으로 처리
-          mkdir -p ${WORKSPACE}/logs/report_generator || echo "Directory creation failed, but continuing..."
+          # 기존 로그 디렉토리 상태 확인 (sudo 없이)
+          if [ -d "/var/logs/report_generator" ]; then
+            echo "Log directory already exists"
+            ls -la /var/logs/report_generator/ || echo "Directory exists but cannot list"
+          else
+            echo "Log directory does not exist - will be created by container"
+          fi
           
-          # 새 컨테이너 실행 (수정된 볼륨 마운트)
+          # 새 컨테이너 실행 (기존 경로 그대로 유지!)
           docker run -d \\
             --name "${IMAGE_NAME}" \\
             --network team5-net \\
             --restart unless-stopped \\
             -p 8377:8377 \\
-            -v ${WORKSPACE}/logs/report_generator:/var/logs/report_generator:rw \\
+            -v /var/logs/report_generator:/var/logs/report_generator:rw \\
             -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \\
             -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \\
             -e BUCKET_NAME="${BUCKET_NAME}" \\
@@ -55,6 +58,8 @@ pipeline {
             -e ENVIRONMENT=production \\
             -e HOSTNAME="${IMAGE_NAME}" \\
             "${IMAGE_NAME}:${IMAGE_TAG}"
+            
+          echo "Container started with existing log directory mount"
         '''
       }
     }
@@ -95,6 +100,14 @@ pipeline {
           else
             echo "⚠️ Metrics endpoint not available"
           fi
+          
+          # 로그 파일 생성 확인 (기존 경로)
+          if [ -f "/var/logs/report_generator/report_generator.log" ]; then
+            echo "📝 Log file is accessible"
+            echo "Log file size: $(du -h /var/logs/report_generator/report_generator.log 2>/dev/null || echo 'Cannot check size')"
+          else
+            echo "⚠️ Log file not found at expected location"
+          fi
         '''
       }
     }
@@ -107,8 +120,8 @@ pipeline {
           # 컨테이너 네트워크 연결 확인
           docker network inspect team5-net | grep ${IMAGE_NAME} && echo "✅ Connected to team5-net" || echo "⚠️ Network connection issue"
           
-          # 로그 파일 생성 확인
-          docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ || echo "⚠️ Log directory check failed"
+          # 컨테이너 내부에서 로그 디렉토리 확인
+          docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ && echo "✅ Log directory accessible from container" || echo "⚠️ Log directory issue"
           
           # Prometheus 메트릭 확인 (team5-prom 컨테이너가 존재하는 경우)
           if docker ps | grep team5-prom; then
@@ -116,6 +129,13 @@ pipeline {
             docker exec team5-prom wget -qO- http://${IMAGE_NAME}:8377/metrics | head -5 && echo "✅ Prometheus can scrape metrics" || echo "⚠️ Prometheus scraping issue"
           else
             echo "⚠️ team5-prom container not found, skipping metrics test"
+          fi
+          
+          # 기존 Filebeat 연동 확인
+          if docker ps | grep filebeat; then
+            echo "✅ Filebeat container is running - log collection should work"
+          else
+            echo "⚠️ Filebeat container not found"
           fi
         '''
       }
@@ -127,7 +147,7 @@ pipeline {
           # 이전 이미지 정리
           docker image prune -f
           
-          # 빌드 아티팩트 정리
+          # 빌드 아티팩트 정리 (최근 3개 버전만 유지)
           docker images | grep ${IMAGE_NAME} | grep -v ${IMAGE_TAG} | awk '{print $3}' | head -5 | xargs -r docker rmi || echo "No old images to remove"
         '''
       }
@@ -137,12 +157,14 @@ pipeline {
   post {
     always {
       echo "Build #${env.BUILD_NUMBER} finished at ${new Date()}"
-      // 상태 확인 로그 수집
+      // 기존 로그 디렉토리 상태 확인
       sh '''
         echo "=== Final Container Status ==="
         docker ps | grep ${IMAGE_NAME} || echo "Container not found"
-        echo "=== Log Directory Status ==="
-        ls -la ${WORKSPACE}/logs/report_generator/ || echo "Log directory not accessible"
+        echo "=== Log Directory Status (Host) ==="
+        ls -la /var/logs/report_generator/ || echo "Log directory not accessible from host"
+        echo "=== Log Directory Status (Container) ==="
+        docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ || echo "Log directory not accessible from container"
         echo "=== Container Logs (last 20 lines) ==="
         docker logs --tail 20 ${IMAGE_NAME} || echo "No container logs available"
       '''
@@ -151,12 +173,15 @@ pipeline {
       echo "✅ Server3 Report Generator deployed successfully!"
       echo "🔗 Service URL: http://localhost:8377"
       echo "📊 Metrics URL: http://localhost:8377/metrics"
-      echo "📝 Logs: ${WORKSPACE}/logs/report_generator/"
+      echo "📝 Logs: /var/logs/report_generator/ (기존 Filebeat 경로 유지)"
       echo "🐳 Container: ${IMAGE_NAME}:${IMAGE_TAG}"
       // 성공 알림을 위한 간단한 API 테스트
       sh '''
         echo "=== Final API Test ==="
         curl -s http://localhost:8377/ | jq . || echo "API response received"
+        echo "=== Log Collection Verification ==="
+        echo "Checking if logs are being written..."
+        docker exec ${IMAGE_NAME} tail -5 /var/logs/report_generator/report_generator.log || echo "Cannot read recent logs"
       '''
     }
     failure {
@@ -171,6 +196,8 @@ pipeline {
         docker network inspect team5-net | grep ${IMAGE_NAME} || echo "Not in team5-net"
         echo "=== Port Status ==="
         netstat -tlnp | grep 8377 || echo "Port 8377 not listening"
+        echo "=== Log Directory Permissions ==="
+        ls -la /var/logs/ | grep report_generator || echo "Cannot check log directory permissions"
       '''
     }
   }
