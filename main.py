@@ -26,7 +26,6 @@ from pythonjsonlogger import jsonlogger
 from prometheus_client import Counter, Histogram, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 
-
 # 메트릭 정의 (실시간 성능 모니터링용)
 team5_report_requests = Counter('team5_report_requests_total', 'Total report requests', ['service'])
 team5_llm_calls = Counter('team5_llm_calls_total', 'Total LLM calls', ['service', 'operation'])
@@ -70,16 +69,30 @@ def setup_dual_logging():
     1. 콘솔: 개발/디버그용 (사람이 읽기 쉬운 형태)
     2. 파일: ELK 수집용 (JSON 구조화)
     """
-    # 로그 디렉토리 생성 - 기존 Filebeat 경로와 일치
-    os.makedirs("/var/logs/report_generator", exist_ok=True)  # 수정된 부분
+    # 로그 디렉토리 생성 - 권한 문제 방지
+    log_dir = "/var/logs/report_generator"
+    log_file = os.path.join(log_dir, "report_generator.log")
+    
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        # 로그 파일 생성 테스트
+        with open(log_file, 'a') as f:
+            f.write(f"# Log initialized at {datetime.utcnow().isoformat()}\n")
+    except Exception as e:
+        print(f"Warning: Could not create log directory {log_dir}: {e}")
+        # 백업 로그 경로 사용
+        log_dir = "/app/logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "report_generator.log")
+        print(f"Using fallback log directory: {log_file}")
     
     # ELK 전용 JSON 포맷터
     elk_formatter = ELKFormatter(
         fmt='%(asctime)s %(name)s %(levelname)s %(message)s'
     )
     
-    # 파일 핸들러 (ELK 수집용 - JSON 형태) - 경로 수정
-    file_handler = logging.FileHandler('/var/logs/report_generator/report_generator.log', encoding='utf-8')
+    # 파일 핸들러 (ELK 수집용 - JSON 형태)
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setFormatter(elk_formatter)
     file_handler.setLevel(logging.INFO)
     
@@ -100,6 +113,7 @@ def setup_dual_logging():
     logger.addHandler(console_handler)  # 운영자용
     
     return logger
+
 # 로거 초기화
 logger = setup_dual_logging()
 
@@ -128,7 +142,7 @@ QWEN_API_URL = "https://qwen3.ap.loclx.io/api/generate"
 # 서비스 시작 로그 (ELK: 서비스 상태 추적용)
 logger.info({
     "event": "service_startup",
-    "version": "2.7",
+    "version": "2.8",
     "monitoring_stack": {
         "prometheus_metrics": "enabled",
         "elk_logging": "enabled",
@@ -138,12 +152,14 @@ logger.info({
         "aws_region": REGION,
         "bucket_name": BUCKET_NAME[:5] + "***",  # 보안상 일부만 로깅
         "pdf_upload_url": PDF_UPLOAD_URL,
-        "qwen_api_url": QWEN_API_URL
+        "qwen_api_url": QWEN_API_URL,
+        "log_level": os.getenv("LOG_LEVEL", "INFO"),
+        "environment": os.getenv("ENVIRONMENT", "production")
     },
     "status": "started"
 })
 
-# ----- 데이터 모델 (기존 동일) -----
+# ----- 기존 데이터 모델들 (변경 없음) -----
 class RelatedDoc(BaseModel):
     page_content: str
     metadata: Dict[str, Any]
@@ -168,32 +184,22 @@ class MeetingInput(BaseModel):
 
 # ----- 기존 텍스트 처리 함수들 (변경 없음) -----
 def add_newlines_between_sentences(text):
-    # 1. 번호로 시작하는 새로운 항목 앞에 줄바꿈
     text = re.sub(r'([.?!])(\d+\.)', r'\1\n\2', text)
-    # 2. 문장부호 후 띄어쓰기 없는 다음 문장에 줄바꿈
     text = re.sub(r'([.?!])([^\s\d])', r'\1\n\2', text)
     return text
 
 def clean_llm_output(text):
     if not isinstance(text, str):
         text = str(text) if text is not None else ""
-    # <think> 태그 제거
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    # 문장 줄바꿈 추가
     text = add_newlines_between_sentences(text)
     return text
 
-# ===== 모니터링 강화된 API 호출 함수 =====
+# ===== 모니터링 강화된 API 호출 함수 (기존과 동일) =====
 async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, request_id: str = None) -> dict:
-    """
-    외부 API 호출 (이중 모니터링)
-    - Prometheus: 호출 횟수, 응답시간 히스토그램
-    - ELK: 상세한 요청/응답 내용, 에러 원인 분석
-    """
     start_time = time.perf_counter()
     req_id = request_id or str(uuid.uuid4())
     
-    # ELK: API 호출 상세 로그
     logger.info({
         "event": "external_api_call",
         "request_id": req_id,
@@ -210,7 +216,6 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, req
             elapsed = time.perf_counter() - start_time
             content_type = response.headers.get('Content-Type', '')
             
-            # ELK: API 성공 로그 (응답 분석용)
             logger.info({
                 "event": "external_api_call",
                 "request_id": req_id,
@@ -229,7 +234,6 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, req
                 else:
                     return json.loads(resp_text)
             except Exception as e:
-                # ELK: API 파싱 에러 (디버깅용)
                 logger.error({
                     "event": "external_api_call",
                     "request_id": req_id,
@@ -244,7 +248,6 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, req
                 
     except Exception as e:
         elapsed = time.perf_counter() - start_time
-        # ELK: API 실패 로그 (장애 분석용)
         logger.error({
             "event": "external_api_call",
             "request_id": req_id,
@@ -257,7 +260,7 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, req
         })
         raise
 
-# ===== 모니터링 강화된 LLM 함수들 =====
+# ===== LLM 함수들 (기존과 동일하지만 로깅 강화) =====
 async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession, request_id: str = None) -> str:
     payload = {
         "prompt": [{"role": "user", "content": f"아래 회의내용을 핵심을 중심으로 요약해주세요. \n핵심내용에 번호를 순서대로 붙여주세요. \n마지막에 추가 요약은 절대 하지 마세요.\n\n회의내용:\n{chunk_text}"}],
@@ -266,7 +269,6 @@ async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession,
         "top_p": 0.9
     }
     
-    # ELK: LLM 작업 추적 (비즈니스 로직 분석용)
     logger.info({
         "event": "llm_operation",
         "request_id": request_id,
@@ -284,7 +286,6 @@ async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession,
         result = await post_json(session, QWEN_API_URL, payload, request_id)
         response_text = clean_llm_output(result.get("response", ""))
         
-        # ELK: LLM 성공 로그 (품질 분석용)
         logger.info({
             "event": "llm_operation",
             "request_id": request_id,
@@ -297,7 +298,6 @@ async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession,
         
         return response_text
     except Exception as e:
-        # ELK: LLM 실패 로그 (에러 분석용)
         logger.error({
             "event": "llm_operation",
             "request_id": request_id,
@@ -309,6 +309,7 @@ async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession,
         })
         raise
 
+# ===== 나머지 LLM 함수들도 동일하게 구현 =====
 async def async_llm_combine_summary(map_summaries: list, session: aiohttp.ClientSession, request_id: str = None) -> str:
     combined_text = "\n".join(map_summaries)
     payload = {
@@ -318,7 +319,6 @@ async def async_llm_combine_summary(map_summaries: list, session: aiohttp.Client
         "top_p": 0.9
     }
     
-    # ELK: LLM 결합 작업 로그
     logger.info({
         "event": "llm_operation",
         "request_id": request_id,
@@ -435,7 +435,7 @@ async def async_llm_combine_action_items(action_items_list: list, session: aioht
         })
         raise
 
-# ----- 기존 보고서 생성 함수들 (변경 없음) -----
+# ----- 기존 보고서 생성 함수들 -----
 def render_markdown_report(summary, actions):
     return f"""# 회의 요약 보고서
 
@@ -459,14 +459,8 @@ def markdown_to_html(md):
     return f"<html><head><meta charset='utf-8'>{css}</head><body>{html}</body></html>"
 
 def html_to_pdf(html, pdf_path, request_id: str = None):
-    """
-    PDF 생성 (이중 모니터링)
-    - Prometheus: 생성 시간 히스토그램, 생성 횟수
-    - ELK: 파일 크기, 에러 원인, 생성 과정 추적
-    """
     start_time = time.perf_counter()
     
-    # ELK: PDF 생성 로그
     logger.info({
         "event": "pdf_generation",
         "request_id": request_id,
@@ -480,7 +474,6 @@ def html_to_pdf(html, pdf_path, request_id: str = None):
         elapsed = time.perf_counter() - start_time
         file_size = os.path.getsize(pdf_path) if os.path.exists(pdf_path) else 0
         
-        # ELK: PDF 생성 성공 로그
         logger.info({
             "event": "pdf_generation",
             "request_id": request_id,
@@ -493,7 +486,6 @@ def html_to_pdf(html, pdf_path, request_id: str = None):
         
     except Exception as e:
         elapsed = time.perf_counter() - start_time
-        # ELK: PDF 생성 실패 로그
         logger.error({
             "event": "pdf_generation",
             "request_id": request_id,
@@ -507,15 +499,9 @@ def html_to_pdf(html, pdf_path, request_id: str = None):
         raise
 
 def upload_to_s3(file_path, bucket, key, request_id: str = None):
-    """
-    S3 업로드 (이중 모니터링)
-    - Prometheus: 업로드 시간, 업로드 횟수
-    - ELK: 파일 정보, S3 응답, 에러 분석
-    """
     start_time = time.perf_counter()
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
     
-    # ELK: S3 업로드 로그
     logger.info({
         "event": "s3_upload",
         "request_id": request_id,
@@ -533,7 +519,6 @@ def upload_to_s3(file_path, bucket, key, request_id: str = None):
         url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=3600)
         elapsed = time.perf_counter() - start_time
         
-        # ELK: S3 업로드 성공 로그
         logger.info({
             "event": "s3_upload",
             "request_id": request_id,
@@ -549,7 +534,6 @@ def upload_to_s3(file_path, bucket, key, request_id: str = None):
         return url
     except Exception as e:
         elapsed = time.perf_counter() - start_time
-        # ELK: S3 업로드 실패 로그
         logger.error({
             "event": "s3_upload",
             "request_id": request_id,
@@ -565,22 +549,16 @@ def upload_to_s3(file_path, bucket, key, request_id: str = None):
         raise
 
 # ----- FastAPI 앱 -----
-app = FastAPI(title="회의 요약 PDF API", version="2.7")
+app = FastAPI(title="회의 요약 PDF API", version="2.8")
 
-# Prometheus 계측 추가 (실시간 메트릭용)
+# Prometheus 계측
 Instrumentator().instrument(app).expose(app)
 
 @app.middleware("http")
 async def dual_monitoring_middleware(request: Request, call_next):
-    """
-    이중 모니터링 미들웨어
-    - Prometheus: 자동 HTTP 메트릭 (Instrumentator가 처리)
-    - ELK: 상세한 요청/응답 로그
-    """
     request_id = str(uuid.uuid4())
     start_time = time.time()
     
-    # ELK: HTTP 요청 시작 로그 (사용자 행동 분석용)
     logger.info({
         "event": "http_request",
         "request_id": request_id,
@@ -596,12 +574,9 @@ async def dual_monitoring_middleware(request: Request, call_next):
         "status": "started"
     })
     
-    # request_id를 요청 상태에 저장
     request.state.request_id = request_id
-    
     response = await call_next(request)
     
-    # ELK: HTTP 요청 완료 로그 (성능 분석용)
     duration = time.time() - start_time
     logger.info({
         "event": "http_request",
@@ -619,21 +594,12 @@ async def dual_monitoring_middleware(request: Request, call_next):
 
 @app.post("/report-json")
 async def report_json(request: MeetingInput, req: Request):
-    """
-    회의 요약 보고서 생성 API
-    
-    모니터링 전략:
-    - Prometheus: 전체 처리량, 에러율, 성능 트렌드
-    - ELK: 개별 요청 추적, 에러 상세 분석, 사용 패턴
-    """
-    # 미들웨어에서 설정한 request_id 가져오기
     request_id = getattr(req.state, 'request_id', str(uuid.uuid4()))
     
-    # Prometheus: 실시간 메트릭 업데이트
+    # Prometheus 메트릭
     team5_report_requests.labels(service="server3-report").inc()
     team5_active_requests.labels(service="server3-report").inc()
     
-    # ELK: 보고서 생성 요청 분석 로그
     logger.info({
         "event": "report_generation_request",
         "request_id": request_id,
@@ -656,7 +622,6 @@ async def report_json(request: MeetingInput, req: Request):
         t_split_end = time.perf_counter()
         split_time = t_split_end - t_split_start
         
-        # ELK: 텍스트 분할 분석 로그
         logger.info({
             "event": "text_processing",
             "request_id": request_id,
@@ -670,10 +635,7 @@ async def report_json(request: MeetingInput, req: Request):
         })
         
         if not chunks:
-            # Prometheus: 에러 카운트
             team5_report_errors.labels(service="server3-report").inc()
-            
-            # ELK: 빈 청크 에러 로그
             logger.error({
                 "event": "report_generation_request",
                 "request_id": request_id,
@@ -688,12 +650,10 @@ async def report_json(request: MeetingInput, req: Request):
             # Step 2. Map 요약
             t_map_start = time.perf_counter()
             try:
-                # Prometheus: LLM 호출 메트릭
                 team5_llm_calls.labels(service="server3-report", operation="map_summary").inc()
                 with team5_llm_call_duration.labels(service="server3-report", operation="map_summary").time():
                     map_summaries = await asyncio.gather(*[async_llm_map_summary(c, session, request_id) for c in chunks])
             except Exception as e:
-                # ELK: Map 요약 실패 로그
                 logger.error({
                     "event": "report_generation_step",
                     "request_id": request_id,
@@ -713,8 +673,6 @@ async def report_json(request: MeetingInput, req: Request):
             try:
                 if len(map_summaries) == 1:
                     full_summary = map_summaries[0]
-                    
-                    # ELK: 단일 요약 로그
                     logger.info({
                         "event": "report_generation_step",
                         "request_id": request_id,
@@ -742,16 +700,14 @@ async def report_json(request: MeetingInput, req: Request):
             t_combine_end = time.perf_counter()
             combine_time = t_combine_end - t_combine_start
 
-            # Step 4. Action Items - Map-Reduce 방식
+            # Step 4. Action Items
             t_action_start = time.perf_counter()
             try:
                 team5_llm_calls.labels(service="server3-report", operation="action_items").inc()
                 with team5_llm_call_duration.labels(service="server3-report", operation="action_items").time():
-                    # 4-1. 각 chunk 요약별로 action item 추출
                     map_action_items = await asyncio.gather(
                         *[async_llm_map_action_items(summary, session, request_id) for summary in map_summaries]
                     )
-                    # 4-2. 여러 action item을 LLM으로 통합
                     if len(map_action_items) == 1:
                         action_items = map_action_items[0]
                     else:
@@ -767,7 +723,7 @@ async def report_json(request: MeetingInput, req: Request):
                     "status": "failed"
                 })
                 team5_report_errors.labels(service="server3-report").inc()
-                raise HTTPException(status_code=500, detail=f"action item(map-reduce) 생성 실패: {e}")
+                raise HTTPException(status_code=500, detail=f"action item 생성 실패: {e}")
             t_action_end = time.perf_counter()
             action_time = t_action_end - t_action_start
 
@@ -778,7 +734,6 @@ async def report_json(request: MeetingInput, req: Request):
             html = markdown_to_html(md)
             t_pdf_start = time.perf_counter()
             try:
-                # Prometheus: PDF 생성 메트릭
                 with team5_pdf_generation_duration.labels(service="server3-report").time():
                     html_to_pdf(html, pdf_path, request_id)
                 team5_pdf_generations.labels(service="server3-report").inc()
@@ -801,7 +756,6 @@ async def report_json(request: MeetingInput, req: Request):
             t_s3_start = time.perf_counter()
             try:
                 s3_key = f"reports/meeting_report_{ts}.pdf"
-                # Prometheus: S3 업로드 메트릭
                 with team5_s3_upload_duration.labels(service="server3-report").time():
                     download_url = upload_to_s3(pdf_path, BUCKET_NAME, s3_key, request_id)
                 team5_s3_uploads.labels(service="server3-report").inc()
@@ -810,7 +764,7 @@ async def report_json(request: MeetingInput, req: Request):
                     "event": "report_generation_step",
                     "request_id": request_id,
                     "step": "s3_upload",
-                    "s3_key": s3_key,
+                    "s3_key": s3_key if 's3_key' in locals() else "unknown",
                     "error_message": str(e),
                     "error_type": type(e).__name__,
                     "status": "failed"
@@ -820,7 +774,7 @@ async def report_json(request: MeetingInput, req: Request):
             t_s3_end = time.perf_counter()
             s3_time = t_s3_end - t_s3_start
 
-            # Step 7. PDF 문서 등록 API 호출
+            # Step 7. 문서 등록
             pdf_doc_id = ""
             t_api_start = time.perf_counter()
             try:
@@ -834,8 +788,6 @@ async def report_json(request: MeetingInput, req: Request):
                             try:
                                 resp_json = json.loads(resp_text)
                                 pdf_doc_id = resp_json.get("doc_id", "")
-                                
-                                # ELK: 문서 등록 성공 로그
                                 logger.info({
                                     "event": "document_registration",
                                     "request_id": request_id,
@@ -844,7 +796,6 @@ async def report_json(request: MeetingInput, req: Request):
                                     "file_name": os.path.basename(pdf_path),
                                     "status": "completed"
                                 })
-                                
                             except Exception as e:
                                 logger.error({
                                     "event": "document_registration",
@@ -862,7 +813,6 @@ async def report_json(request: MeetingInput, req: Request):
                                 "error_message": resp_text,
                                 "status": "http_error"
                             })
-                            raise HTTPException(status_code=resp.status, detail=resp_text)
             except Exception as e:
                 logger.error({
                     "event": "document_registration",
@@ -890,11 +840,12 @@ async def report_json(request: MeetingInput, req: Request):
                         "error_message": str(e),
                         "status": "failed"
                     })
+                    
             t_api_end = time.perf_counter()
             api_time = t_api_end - t_api_start
             total_time = t_api_end - t0
 
-            # ELK: 전체 보고서 생성 완료 로그 (성능 분석용)
+            # 최종 완료 로그
             logger.info({
                 "event": "report_generation_request",
                 "request_id": request_id,
@@ -923,7 +874,6 @@ async def report_json(request: MeetingInput, req: Request):
                 "status": "completed"
             })
 
-            # Prometheus: 전체 처리 시간 메트릭
             team5_report_processing_duration.labels(service="server3-report").observe(total_time)
 
             return {
@@ -936,7 +886,6 @@ async def report_json(request: MeetingInput, req: Request):
     except HTTPException:
         raise
     except Exception as e:
-        # ELK: 예상치 못한 에러 로그 (상세 디버깅용)
         logger.error({
             "event": "report_generation_request",
             "request_id": request_id,
@@ -946,16 +895,30 @@ async def report_json(request: MeetingInput, req: Request):
             "input_preview": request.text_stt[:200] if hasattr(request, 'text_stt') else None,
             "status": "unexpected_error"
         })
-        # Prometheus: 에러 카운트
         team5_report_errors.labels(service="server3-report").inc()
         raise HTTPException(status_code=500, detail=f"처리 중 알 수 없는 오류: {e}")
     finally:
-        # Prometheus: 활성 요청 수 감소
         team5_active_requests.labels(service="server3-report").dec()
 
 @app.get("/")
 def root():
-    return {"message": "회의 요약 PDF API 작동 중"}
+    return {
+        "message": "회의 요약 PDF API 작동 중",
+        "version": "2.8",
+        "monitoring": {
+            "prometheus": "enabled",
+            "elk_logging": "enabled"
+        }
+    }
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "server3-report",
+        "version": "2.8"
+    }
 
 # 서비스 종료 시 로그
 @app.on_event("shutdown")

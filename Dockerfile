@@ -21,7 +21,7 @@ RUN fc-cache -f -v
 # 작업 디렉토리 설정
 WORKDIR /app
 
-# 로그 디렉토리 생성 및 권한 설정
+# 로그 디렉토리 생성 및 권한 설정 (컨테이너 내부에서 생성)
 RUN mkdir -p /var/logs/report_generator && \
     chmod 755 /var/logs/report_generator
 
@@ -39,6 +39,10 @@ COPY . /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 ENV LOG_LEVEL=INFO
+
+# 로그 파일 미리 생성 (권한 이슈 방지)
+RUN touch /var/logs/report_generator/report_generator.log && \
+    chmod 644 /var/logs/report_generator/report_generator.log
 
 # 헬스체크 추가
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

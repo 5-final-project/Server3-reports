@@ -27,30 +27,33 @@ pipeline {
     stage('Deploy Container') {
       steps {
         sh '''
-          # 기존 컨테이너 정리 (sh 호환 문법)
+          # 기존 컨테이너 정리 (호환 가능한 문법)
           for name in great_villani server3-report-generator server3-report; do
-            if docker ps -a --filter "name=^/${name}$" --format "{{.Names}}" | grep -q "^${name}$"; then
+            container_exists=$(docker ps -a --filter "name=^/${name}$" --format "{{.Names}}" | grep "^${name}$" || echo "")
+            if [ ! -z "$container_exists" ]; then
               echo "Stopping and removing container ${name}"
               docker rm -f "${name}"
             fi
           done
           
-          # 로그 디렉토리 권한 확인 및 생성
-          sudo mkdir -p /var/logs/report_generator
-          sudo chmod 755 /var/logs/report_generator
+          # 호스트에서 로그 디렉토리 생성 (sudo 없이)
+          # Jenkins 사용자가 쓸 수 있는 위치로 변경하거나, 도커 볼륨으로 처리
+          mkdir -p ${WORKSPACE}/logs/report_generator || echo "Directory creation failed, but continuing..."
           
-          # 새 컨테이너 실행
+          # 새 컨테이너 실행 (수정된 볼륨 마운트)
           docker run -d \\
             --name "${IMAGE_NAME}" \\
             --network team5-net \\
             --restart unless-stopped \\
             -p 8377:8377 \\
-            -v /var/logs/report_generator:/var/logs/report_generator:rw \\
+            -v ${WORKSPACE}/logs/report_generator:/var/logs/report_generator:rw \\
             -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \\
             -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \\
             -e BUCKET_NAME="${BUCKET_NAME}" \\
             -e AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}" \\
             -e ENABLE_METRICS=true \\
+            -e ENVIRONMENT=production \\
+            -e HOSTNAME="${IMAGE_NAME}" \\
             "${IMAGE_NAME}:${IMAGE_TAG}"
         '''
       }
@@ -63,9 +66,13 @@ pipeline {
           sleep 20
           
           # 컨테이너 상태 확인
-          docker ps | grep ${IMAGE_NAME} || (echo "Container not running" && exit 1)
+          if ! docker ps | grep ${IMAGE_NAME}; then
+            echo "❌ Container not running"
+            docker logs ${IMAGE_NAME} || echo "No logs available"
+            exit 1
+          fi
           
-          # Health check with retry (sh 호환 문법)
+          # Health check with retry
           for i in 1 2 3 4 5; do
             if curl -f http://localhost:8377/ > /dev/null 2>&1; then
               echo "✅ Server3 Report Generator is running successfully"
@@ -88,13 +95,6 @@ pipeline {
           else
             echo "⚠️ Metrics endpoint not available"
           fi
-          
-          # 로그 파일 생성 확인
-          if [ -f "/var/logs/report_generator/report_generator.log" ]; then
-            echo "📝 Log file created successfully"
-          else
-            echo "⚠️ Log file not found yet"
-          fi
         '''
       }
     }
@@ -104,14 +104,18 @@ pipeline {
         sh '''
           echo "Running integration tests..."
           
-          # Team5-net 네트워크 연결 확인
-          docker exec ${IMAGE_NAME} ping -c 2 elasticsearch || echo "Elasticsearch ping failed"
+          # 컨테이너 네트워크 연결 확인
+          docker network inspect team5-net | grep ${IMAGE_NAME} && echo "✅ Connected to team5-net" || echo "⚠️ Network connection issue"
           
-          # Prometheus 메트릭 확인
-          if docker exec team5-prom wget -qO- http://${IMAGE_NAME}:8377/metrics | head -5; then
-            echo "✅ Prometheus can scrape metrics"
+          # 로그 파일 생성 확인
+          docker exec ${IMAGE_NAME} ls -la /var/logs/report_generator/ || echo "⚠️ Log directory check failed"
+          
+          # Prometheus 메트릭 확인 (team5-prom 컨테이너가 존재하는 경우)
+          if docker ps | grep team5-prom; then
+            echo "Checking Prometheus metrics..."
+            docker exec team5-prom wget -qO- http://${IMAGE_NAME}:8377/metrics | head -5 && echo "✅ Prometheus can scrape metrics" || echo "⚠️ Prometheus scraping issue"
           else
-            echo "⚠️ Prometheus scraping issue"
+            echo "⚠️ team5-prom container not found, skipping metrics test"
           fi
         '''
       }
@@ -119,9 +123,13 @@ pipeline {
         
     stage('Cleanup') {
       steps {
-        script {
-          sh "docker image prune -f"
-        }
+        sh '''
+          # 이전 이미지 정리
+          docker image prune -f
+          
+          # 빌드 아티팩트 정리
+          docker images | grep ${IMAGE_NAME} | grep -v ${IMAGE_TAG} | awk '{print $3}' | head -5 | xargs -r docker rmi || echo "No old images to remove"
+        '''
       }
     }
   }
@@ -129,30 +137,40 @@ pipeline {
   post {
     always {
       echo "Build #${env.BUILD_NUMBER} finished at ${new Date()}"
-      // 로그 수집 상태 확인
+      // 상태 확인 로그 수집
       sh '''
         echo "=== Final Container Status ==="
         docker ps | grep ${IMAGE_NAME} || echo "Container not found"
         echo "=== Log Directory Status ==="
-        ls -la /var/logs/report_generator/ || echo "Log directory not accessible"
+        ls -la ${WORKSPACE}/logs/report_generator/ || echo "Log directory not accessible"
+        echo "=== Container Logs (last 20 lines) ==="
+        docker logs --tail 20 ${IMAGE_NAME} || echo "No container logs available"
       '''
     }
     success {
       echo "✅ Server3 Report Generator deployed successfully!"
       echo "🔗 Service URL: http://localhost:8377"
       echo "📊 Metrics URL: http://localhost:8377/metrics"
-      echo "📝 Logs: /var/logs/report_generator/"
-      echo "🔍 Kibana: Check report-generator-logs-* index"
+      echo "📝 Logs: ${WORKSPACE}/logs/report_generator/"
+      echo "🐳 Container: ${IMAGE_NAME}:${IMAGE_TAG}"
+      // 성공 알림을 위한 간단한 API 테스트
+      sh '''
+        echo "=== Final API Test ==="
+        curl -s http://localhost:8377/ | jq . || echo "API response received"
+      '''
     }
     failure {
       echo "❌ Deployment failed"
       sh '''
-        echo "=== Container Logs ==="
+        echo "=== Failure Analysis ==="
+        echo "Container Logs:"
         docker logs ${IMAGE_NAME} || echo "No container logs available"
-        echo "=== System Status ==="
-        docker ps -a | grep ${IMAGE_NAME}
+        echo "=== Container Status ==="
+        docker ps -a | grep ${IMAGE_NAME} || echo "Container not found"
         echo "=== Network Status ==="
         docker network inspect team5-net | grep ${IMAGE_NAME} || echo "Not in team5-net"
+        echo "=== Port Status ==="
+        netstat -tlnp | grep 8377 || echo "Port 8377 not listening"
       '''
     }
   }
