@@ -35,9 +35,13 @@ pipeline {
             fi
           done
           
-          # 로그 디렉토리 생성 (Host에서)
-          sudo mkdir -p /var/logs/report_generator
-          sudo chmod 755 /var/logs/report_generator
+          # 로그 디렉토리 상태 확인 (sudo 제거)
+          if [ -d "/var/logs/report_generator" ]; then
+            echo "✅ Log directory already exists"
+            ls -la /var/logs/report_generator/
+          else
+            echo "⚠️ Log directory does not exist - will be created by container"
+          fi
           
           # 새 컨테이너 실행 (Filebeat 호환 경로로 볼륨 마운트)
           docker run -d \\
