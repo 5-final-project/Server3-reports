@@ -16,14 +16,30 @@ from weasyprint import HTML
 import aiohttp
 import asyncio
 
-# ----- 로그 설정 -----
+# ===== Prometheus 메트릭 추가 =====
+from prometheus_client import Counter, Histogram, Gauge
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# 메트릭 정의
+team5_report_requests = Counter('team5_report_requests_total', 'Total report requests', ['service'])
+team5_llm_calls = Counter('team5_llm_calls_total', 'Total LLM calls', ['service', 'operation'])
+team5_llm_call_duration = Histogram('team5_llm_call_seconds', 'LLM call duration', ['service', 'operation'])
+team5_report_errors = Counter('team5_report_errors_total', 'Total report errors', ['service'])
+team5_active_requests = Gauge('team5_report_active_requests', 'Active report requests', ['service'])
+team5_pdf_generations = Counter('team5_pdf_generations_total', 'Total PDF generations', ['service'])
+team5_s3_uploads = Counter('team5_s3_uploads_total', 'Total S3 uploads', ['service'])
+team5_pdf_generation_duration = Histogram('team5_pdf_generation_seconds', 'PDF generation duration', ['service'])
+team5_s3_upload_duration = Histogram('team5_s3_upload_seconds', 'S3 upload duration', ['service'])
+team5_report_processing_duration = Histogram('team5_report_processing_seconds', 'Total report processing time', ['service'])
+
+# ----- 기존 로그 설정 (변경 없음) -----
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger("meeting-summary")
 
-# ----- 환경변수 로드 및 체크 -----
+# ----- 기존 환경변수 로드 및 체크 (변경 없음) -----
 load_dotenv()
 REQUIRED_ENV_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME"]
 for v in REQUIRED_ENV_VARS:
@@ -38,7 +54,7 @@ REGION = os.getenv("AWS_DEFAULT_REGION", "ap-northeast-2")
 PDF_UPLOAD_URL = "https://team5opensearch.ap.loclx.io/documents/upload-without-s3"
 QWEN_API_URL = "https://qwen3.ap.loclx.io/api/generate"
 
-# ----- 데이터 모델 -----
+# ----- 기존 데이터 모델 (변경 없음) -----
 class RelatedDoc(BaseModel):
     page_content: str
     metadata: Dict[str, Any]
@@ -61,7 +77,7 @@ class MeetingInput(BaseModel):
     elapsed_time: Optional[float] = None
     error: Optional[str] = None
 
-# ----- 줄바꿈 후처리 함수 -----
+# ----- 기존 줄바꿈 후처리 함수 (변경 없음) -----
 def add_newlines_between_sentences(text):
     # 1. 번호로 시작하는 새로운 항목 앞에 줄바꿈
     text = re.sub(r'([.?!])(\d+\.)', r'\1\n\2', text)
@@ -69,7 +85,7 @@ def add_newlines_between_sentences(text):
     text = re.sub(r'([.?!])([^\s\d])', r'\1\n\2', text)
     return text
 
-# ----- LLM 처리 함수 -----
+# ----- 기존 LLM 처리 함수 (변경 없음) -----
 def clean_llm_output(text):
     if not isinstance(text, str):
         text = str(text) if text is not None else ""
@@ -125,7 +141,7 @@ async def async_llm_combine_summary(map_summaries: list, session: aiohttp.Client
         logger.error(f"async_llm_combine_summary 에러: {e}")
         raise
 
-# [추가] Action Item map-reduce 방식 함수들
+# [기존] Action Item map-reduce 방식 함수들 (변경 없음)
 async def async_llm_map_action_items(summary_text: str, session: aiohttp.ClientSession) -> str:
     payload = {
         "prompt": [{"role": "user", "content": f"아래 요약문을 바탕으로 앞으로 해야할 일(To-Do List)을 작성해주세요. 각 list 항목에 번호를 붙여주세요. \n 마지막에 추가 요약은 절대 하지 마세요.\n\n{summary_text}"}],
@@ -155,7 +171,7 @@ async def async_llm_combine_action_items(action_items_list: list, session: aioht
         logger.error(f"async_llm_combine_action_items 에러: {e}")
         raise
 
-# ----- 보고서 생성 함수 -----
+# ----- 기존 보고서 생성 함수 (변경 없음) -----
 def render_markdown_report(summary, actions):
     return f"""# 회의 요약 보고서
 
@@ -191,16 +207,23 @@ def upload_to_s3(file_path, bucket, key):
         logger.error(f"S3 업로드 에러: {e}")
         raise
 
-# ----- FastAPI 앱 -----
+# ----- FastAPI 앱 (메트릭 추가) -----
 app = FastAPI(title="회의 요약 PDF API", version="2.7")
+
+# Prometheus 계측 추가
+Instrumentator().instrument(app).expose(app)
 
 @app.post("/report-json")
 async def report_json(request: MeetingInput):
+    # 메트릭: 요청 시작
+    team5_report_requests.labels(service="server3-report").inc()
+    team5_active_requests.labels(service="server3-report").inc()
+    
     try:
         t0 = time.perf_counter()
         logger.info("요약 요청 수신")
 
-        # Step 1. 텍스트 분할
+        # Step 1. 텍스트 분할 (기존 로직 동일)
         t_split_start = time.perf_counter()
         splitter = RecursiveCharacterTextSplitter(chunk_size=7000, chunk_overlap=100)
         chunks = splitter.split_text(request.text_stt)
@@ -208,81 +231,98 @@ async def report_json(request: MeetingInput):
         split_time = t_split_end - t_split_start
         logger.info(f"[STEP 1] 텍스트 분할 완료 (chunk={len(chunks)}, 소요={split_time:.2f}s, 누적={t_split_end-t0:.2f}s)")
         if not chunks:
+            team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
             raise HTTPException(status_code=400, detail="요약할 텍스트가 없습니다.")
 
         async with aiohttp.ClientSession() as session:
-            # Step 2. Map 요약
+            # Step 2. Map 요약 (기존 로직 + 메트릭)
             t_map_start = time.perf_counter()
             try:
-                map_summaries = await asyncio.gather(*[async_llm_map_summary(c, session) for c in chunks])
+                # 메트릭: LLM 호출 카운트 및 시간 측정
+                team5_llm_calls.labels(service="server3-report", operation="map_summary").inc()
+                with team5_llm_call_duration.labels(service="server3-report", operation="map_summary").time():
+                    map_summaries = await asyncio.gather(*[async_llm_map_summary(c, session) for c in chunks])
             except Exception as e:
                 logger.error(f"[STEP 2] map 요약 실패: {e}")
+                team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
                 raise HTTPException(status_code=500, detail=f"map 요약 실패: {e}")
             t_map_end = time.perf_counter()
             map_time = t_map_end - t_map_start
             logger.info(f"[STEP 2] map 요약 완료 (소요={map_time:.2f}s, 누적={t_map_end-t0:.2f}s)")
 
-            # Step 3. Combine 요약
+            # Step 3. Combine 요약 (기존 로직 + 메트릭)
             t_combine_start = time.perf_counter()
             try:
                 if len(map_summaries) == 1:
                     full_summary = map_summaries[0]
                 else:
-                    full_summary = await async_llm_combine_summary(map_summaries, session)
+                    team5_llm_calls.labels(service="server3-report", operation="combine_summary").inc()
+                    with team5_llm_call_duration.labels(service="server3-report", operation="combine_summary").time():
+                        full_summary = await async_llm_combine_summary(map_summaries, session)
             except Exception as e:
                 logger.error(f"[STEP 3] combine 요약 실패: {e}")
+                team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
                 raise HTTPException(status_code=500, detail=f"combine 요약 실패: {e}")
             t_combine_end = time.perf_counter()
             combine_time = t_combine_end - t_combine_start
             logger.info(f"[STEP 3] combine 요약 완료 (소요={combine_time:.2f}s, 누적={t_combine_end-t0:.2f}s)")
 
-            # Step 4. Action Items - Map-Reduce 방식
+            # Step 4. Action Items - Map-Reduce 방식 (기존 로직 + 메트릭)
             t_action_start = time.perf_counter()
             try:
-                # 4-1. 각 chunk 요약별로 action item 추출
-                map_action_items = await asyncio.gather(
-                    *[async_llm_map_action_items(summary, session) for summary in map_summaries]
-                )
-                # 4-2. 여러 action item을 LLM으로 통합
-                if len(map_action_items) == 1:
-                    action_items = map_action_items[0]
-                else:
-                    action_items = await async_llm_combine_action_items(map_action_items, session)
+                team5_llm_calls.labels(service="server3-report", operation="action_items").inc()
+                with team5_llm_call_duration.labels(service="server3-report", operation="action_items").time():
+                    # 4-1. 각 chunk 요약별로 action item 추출
+                    map_action_items = await asyncio.gather(
+                        *[async_llm_map_action_items(summary, session) for summary in map_summaries]
+                    )
+                    # 4-2. 여러 action item을 LLM으로 통합
+                    if len(map_action_items) == 1:
+                        action_items = map_action_items[0]
+                    else:
+                        action_items = await async_llm_combine_action_items(map_action_items, session)
             except Exception as e:
                 logger.error(f"[STEP 4] action item(map-reduce) 생성 실패: {e}")
+                team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
                 raise HTTPException(status_code=500, detail=f"action item(map-reduce) 생성 실패: {e}")
             t_action_end = time.perf_counter()
             action_time = t_action_end - t_action_start
             logger.info(f"[STEP 4] action items(map-reduce) 생성 완료 (소요={action_time:.2f}s, 누적={t_action_end-t0:.2f}s)")
 
-            # Step 5. PDF 생성
+            # Step 5. PDF 생성 (기존 로직 + 메트릭)
             ts = int(time.time())
             pdf_path = os.path.abspath(f"meeting_report_{ts}.pdf")
             md = render_markdown_report(full_summary, action_items)
             html = markdown_to_html(md)
             t_pdf_start = time.perf_counter()
             try:
-                html_to_pdf(html, pdf_path)
+                with team5_pdf_generation_duration.labels(service="server3-report").time():
+                    html_to_pdf(html, pdf_path)
+                team5_pdf_generations.labels(service="server3-report").inc()  # 메트릭 추가
             except Exception as e:
                 logger.error(f"[STEP 5] PDF 생성 실패: {e}")
+                team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
                 raise HTTPException(status_code=500, detail=f"PDF 생성 실패: {e}")
             t_pdf_end = time.perf_counter()
             pdf_time = t_pdf_end - t_pdf_start
             logger.info(f"[STEP 5] PDF 생성 완료 (소요={pdf_time:.2f}s, 누적={t_pdf_end-t0:.2f}s)")
 
-            # Step 6. S3 업로드
+            # Step 6. S3 업로드 (기존 로직 + 메트릭)
             t_s3_start = time.perf_counter()
             try:
                 s3_key = f"reports/meeting_report_{ts}.pdf"
-                download_url = upload_to_s3(pdf_path, BUCKET_NAME, s3_key)
+                with team5_s3_upload_duration.labels(service="server3-report").time():
+                    download_url = upload_to_s3(pdf_path, BUCKET_NAME, s3_key)
+                team5_s3_uploads.labels(service="server3-report").inc()  # 메트릭 추가
             except Exception as e:
                 logger.error(f"[STEP 6] S3 업로드 실패: {e}")
+                team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
                 raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
             t_s3_end = time.perf_counter()
             s3_time = t_s3_end - t_s3_start
             logger.info(f"[STEP 6] S3 업로드 완료 (소요={s3_time:.2f}s, 누적={t_s3_end-t0:.2f}s)")
 
-            # Step 7. PDF 문서 등록 API 호출
+            # Step 7. PDF 문서 등록 API 호출 (기존 로직 동일)
             pdf_doc_id = ""
             t_api_start = time.perf_counter()
             try:
@@ -318,6 +358,9 @@ async def report_json(request: MeetingInput):
             logger.info(f"[STEP 7] 문서등록API 호출 완료 (소요={api_time:.2f}s, 누적={t_api_end-t0:.2f}s)")
             logger.info(f"[전체] 총 소요시간: {total_time:.2f}s")
 
+            # 메트릭: 전체 처리 시간 기록
+            team5_report_processing_duration.labels(service="server3-report").observe(total_time)
+
             return {
                 "intermediate_summary": full_summary,
                 "action_items": action_items,
@@ -328,8 +371,12 @@ async def report_json(request: MeetingInput):
     except HTTPException:
         raise
     except Exception as e:
+        team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
         logger.exception("알 수 없는 서버 오류")
         raise HTTPException(status_code=500, detail=f"처리 중 알 수 없는 오류: {e}")
+    finally:
+        # 메트릭: 활성 요청 수 감소
+        team5_active_requests.labels(service="server3-report").dec()
 
 @app.get("/")
 def root():

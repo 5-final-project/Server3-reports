@@ -9,3 +9,10 @@ langchain
 pydantic
 markdown2
 weasyprint
+
+# Prometheus 메트릭 추가
+prometheus_client
+prometheus-fastapi-instrumentator
+
+# 로그
+python-json-logger
