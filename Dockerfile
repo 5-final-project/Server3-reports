@@ -21,6 +21,9 @@ RUN fc-cache -f -v
 # 작업 디렉토리 설정
 WORKDIR /app
 
+# 로그 디렉토리 생성 (추가됨)
+RUN mkdir -p /var/logs/report_generator && chmod 755 /var/logs/report_generator
+
 # 프로젝트 코드 복사
 COPY . /app
 

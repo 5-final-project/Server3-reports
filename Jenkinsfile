@@ -43,7 +43,7 @@ pipeline {
             --name "${IMAGE_NAME}" \
             --network team5-net \
             -p 8377:8377 \
-            -v /var/logs/report_generator:/app/logs \
+            -v /var/logs/report_generator:/var/logs/report_generator \
             -e AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
             -e AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
             -e BUCKET_NAME=${BUCKET_NAME} \
