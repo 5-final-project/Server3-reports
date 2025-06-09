@@ -5,6 +5,7 @@ import re
 import boto3
 import markdown2
 import json
+import requests
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
@@ -93,13 +94,13 @@ logger.info("Server3-Report starting with JSON logging enabled", extra={
     'extra_fields': {
         'event': 'service_startup',
         'log_file': log_file_path,
-        'version': '2.7'
+        'version': '2.8'
     }
 })
 
-# ----- 기존 환경변수 로드 및 체크 (변경 없음) -----
+# ----- 환경변수 로드 및 체크 (RunPod 설정 추가) -----
 load_dotenv()
-REQUIRED_ENV_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME"]
+REQUIRED_ENV_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME", "RUNPOD_API_KEY", "RUNPOD_ENDPOINT_ID"]
 for v in REQUIRED_ENV_VARS:
     if not os.getenv(v):
         logger.error(f"환경변수 {v}가 누락되어 있습니다.")
@@ -111,6 +112,10 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION = os.getenv("AWS_DEFAULT_REGION", "ap-northeast-2")
 PDF_UPLOAD_URL = "https://team5opensearch.ap.loclx.io/documents/upload-without-s3"
 QWEN_API_URL = "https://qwen3.ap.loclx.io/api/generate"
+
+# RunPod 설정
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
+RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 
 # ----- 기존 데이터 모델 (변경 없음) -----
 class RelatedDoc(BaseModel):
@@ -153,6 +158,93 @@ def clean_llm_output(text):
     text = add_newlines_between_sentences(text)
     return text
 
+# ----- RunPod API 함수 추가 -----
+def run_llm_job_sync(prompt: str, max_tokens: int = 8192, temperature: float = 0.7):
+    """RunPod runsync 요청을 보내고, 결과가 완료될 때까지 기다린 후 출력."""
+    # 헤더 설정
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {RUNPOD_API_KEY}'
+    }
+    
+    # 요청 본문
+    payload = {
+        'input': {
+            'prompt': prompt,
+            'sampling_params': {
+                'max_tokens': max_tokens,
+                'temperature': temperature,
+                'top_p': 0.95
+            }
+        }
+    }
+    
+    # POST 요청 (runsync)
+    logger.info("RunPod LLM 요청 전송 중...")
+    response = requests.post(
+        f'https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync',
+        headers=headers,
+        json=payload,
+        timeout=300  # 5분 타임아웃
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"RunPod API 요청 실패: {response.status_code} - {response.text}")
+    
+    res_json = response.json()
+    job_id = res_json.get("id")
+    status = res_json.get("status")
+    
+    # 만약 바로 결과가 오면 처리
+    if status == "COMPLETED":
+        logger.info("RunPod 작업 완료")
+        return res_json['output']
+    
+    # 진행 중이면 폴링 시작
+    logger.info(f"RunPod 작업 진행 (job_id: {job_id})")
+    max_retries = 150  # 최대 5분 대기 (2초 * 150)
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        time.sleep(2)  # 2초 간격으로 조회
+        try:
+            poll_response = requests.get(
+                f'https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{job_id}',
+                headers=headers,
+                timeout=30
+            )
+            
+            if poll_response.status_code != 200:
+                logger.warning(f"RunPod 상태 조회 실패: {poll_response.status_code}")
+                retry_count += 1
+                continue
+                
+            poll_json = poll_response.json()
+            poll_status = poll_json.get("status")
+            
+            if poll_status == "COMPLETED":
+                logger.info("RunPod 작업 완료")
+                return poll_json['output']
+            elif poll_status == "FAILED":
+                error_msg = poll_json.get('error', 'No error message')
+                logger.error(f"RunPod 작업 실패: {error_msg}")
+                raise Exception(f"RunPod 작업 실패: {error_msg}")
+            elif poll_status == "CANCELLED":
+                logger.error("RunPod 작업 취소")
+                raise Exception("RunPod 작업 취소")
+            elif poll_status == "IN_PROGRESS":
+                logger.info("RunPod 작업 진행 중")
+            else:
+                logger.info(f"RunPod 작업 대기 중 (status: {poll_status})")
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"RunPod 상태 조회 중 네트워크 오류: {e}")
+        
+        retry_count += 1
+    
+    # 타임아웃
+    raise Exception("RunPod 작업 타임아웃 (5분 초과)")
+
 async def post_json(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
     try:
         async with session.post(url, json=payload) as response:
@@ -184,19 +276,21 @@ async def async_llm_map_summary(chunk_text: str, session: aiohttp.ClientSession)
         logger.error(f"async_llm_map_summary 에러: {e}")
         raise
 
-async def async_llm_combine_summary(map_summaries: list, session: aiohttp.ClientSession) -> str:
+# RunPod를 사용하는 combine 요약 함수로 수정
+def llm_combine_summary_runpod(map_summaries: list) -> str:
+    """RunPod API를 사용하여 여러 요약을 통합"""
     combined_text = "\n".join(map_summaries)
-    payload = {
-        "prompt": [{"role": "user", "content": f"여러 회의 요약문이 아래에 나열되어 있습니다. 중복 없이 통합 정리해주세요. \n핵심내용에 번호를 순서대로 붙여주세요. \n마지막에 추가 요약은 절대 하지 마세요.\n\n{combined_text}"}],
-        "max_tokens": 30000,
-        "temperature": 0.7,
-        "top_p": 0.9
-    }
+    prompt = f"""여러 회의 요약문이 아래에 나열되어 있습니다. 중복 없이 통합 정리해주세요. 
+핵심내용에 번호를 순서대로 붙여주세요. 
+마지막에 추가 요약은 절대 하지 마세요.
+
+{combined_text}"""
+    
     try:
-        result = await post_json(session, QWEN_API_URL, payload)
-        return clean_llm_output(result.get("response", ""))
+        result = run_llm_job_sync(prompt, max_tokens=8192, temperature=0.7)
+        return clean_llm_output(result)
     except Exception as e:
-        logger.error(f"async_llm_combine_summary 에러: {e}")
+        logger.error(f"llm_combine_summary_runpod 에러: {e}")
         raise
 
 # [기존] Action Item map-reduce 방식 함수들 (변경 없음)
@@ -214,19 +308,19 @@ async def async_llm_map_action_items(summary_text: str, session: aiohttp.ClientS
         logger.error(f"async_llm_map_action_items 에러: {e}")
         raise
 
-async def async_llm_combine_action_items(action_items_list: list, session: aiohttp.ClientSession) -> str:
+# RunPod를 사용하는 Action Items combine 함수로 수정
+def llm_combine_action_items_runpod(action_items_list: list) -> str:
+    """RunPod API를 사용하여 여러 Action Items를 통합"""
     combined_text = "\n".join(action_items_list)
-    payload = {
-        "prompt": [{"role": "user", "content": f"앞으로 해야할 일들의 리스트가 아래에 나열되어 있습니다. 중복을 제거하고, 통합 정리해서 To-Do List만 번호와 함께 다시 출력해주세요. 마지막에 추가 요약은 하지 마세요.\n\n{combined_text}"}],
-        "max_tokens": 30000,
-        "temperature": 0.7,
-        "top_p": 0.9
-    }
+    prompt = f"""앞으로 해야할 일들의 리스트가 아래에 나열되어 있습니다. 중복을 제거하고, 통합 정리해서 To-Do List만 번호와 함께 다시 출력해주세요. 마지막에 추가 요약은 하지 마세요.
+
+{combined_text}"""
+    
     try:
-        result = await post_json(session, QWEN_API_URL, payload)
-        return clean_llm_output(result.get("response", ""))
+        result = run_llm_job_sync(prompt, max_tokens=8192, temperature=0.7)
+        return clean_llm_output(result)
     except Exception as e:
-        logger.error(f"async_llm_combine_action_items 에러: {e}")
+        logger.error(f"llm_combine_action_items_runpod 에러: {e}")
         raise
 
 # ----- 기존 보고서 생성 함수 (변경 없음) -----
@@ -266,7 +360,7 @@ def upload_to_s3(file_path, bucket, key):
         raise
 
 # ----- FastAPI 앱 (메트릭 추가) -----
-app = FastAPI(title="회의 요약 PDF API", version="2.7")
+app = FastAPI(title="회의 요약 PDF API", version="2.8")
 
 # Prometheus 계측 추가
 Instrumentator().instrument(app).expose(app)
@@ -313,44 +407,44 @@ async def report_json(request: MeetingInput):
             map_time = t_map_end - t_map_start
             logger.info(f"[STEP 2] map 요약 완료 (소요={map_time:.2f}s, 누적={t_map_end-t0:.2f}s)")
 
-            # Step 3. Combine 요약 (기존 로직 + 메트릭)
+            # Step 3. Combine 요약 (RunPod API 사용으로 수정)
             t_combine_start = time.perf_counter()
             try:
                 if len(map_summaries) == 1:
                     full_summary = map_summaries[0]
                 else:
-                    team5_llm_calls.labels(service="server3-report", operation="combine_summary").inc()
-                    with team5_llm_call_duration.labels(service="server3-report", operation="combine_summary").time():
-                        full_summary = await async_llm_combine_summary(map_summaries, session)
+                    team5_llm_calls.labels(service="server3-report", operation="combine_summary_runpod").inc()
+                    with team5_llm_call_duration.labels(service="server3-report", operation="combine_summary_runpod").time():
+                        full_summary = llm_combine_summary_runpod(map_summaries)
             except Exception as e:
-                logger.error(f"[STEP 3] combine 요약 실패: {e}")
+                logger.error(f"[STEP 3] combine 요약(RunPod) 실패: {e}")
                 team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
-                raise HTTPException(status_code=500, detail=f"combine 요약 실패: {e}")
+                raise HTTPException(status_code=500, detail=f"combine 요약(RunPod) 실패: {e}")
             t_combine_end = time.perf_counter()
             combine_time = t_combine_end - t_combine_start
-            logger.info(f"[STEP 3] combine 요약 완료 (소요={combine_time:.2f}s, 누적={t_combine_end-t0:.2f}s)")
+            logger.info(f"[STEP 3] combine 요약(RunPod) 완료 (소요={combine_time:.2f}s, 누적={t_combine_end-t0:.2f}s)")
 
-            # Step 4. Action Items - Map-Reduce 방식 (기존 로직 + 메트릭)
+            # Step 4. Action Items - Map-Reduce 방식 (일부 RunPod 사용으로 수정)
             t_action_start = time.perf_counter()
             try:
                 team5_llm_calls.labels(service="server3-report", operation="action_items").inc()
                 with team5_llm_call_duration.labels(service="server3-report", operation="action_items").time():
-                    # 4-1. 각 chunk 요약별로 action item 추출
+                    # 4-1. 각 chunk 요약별로 action item 추출 (기존 API 사용)
                     map_action_items = await asyncio.gather(
                         *[async_llm_map_action_items(summary, session) for summary in map_summaries]
                     )
-                    # 4-2. 여러 action item을 LLM으로 통합
+                    # 4-2. 여러 action item을 RunPod로 통합
                     if len(map_action_items) == 1:
                         action_items = map_action_items[0]
                     else:
-                        action_items = await async_llm_combine_action_items(map_action_items, session)
+                        action_items = llm_combine_action_items_runpod(map_action_items)
             except Exception as e:
-                logger.error(f"[STEP 4] action item(map-reduce) 생성 실패: {e}")
+                logger.error(f"[STEP 4] action item(map-reduce with RunPod) 생성 실패: {e}")
                 team5_report_errors.labels(service="server3-report").inc()  # 메트릭 추가
-                raise HTTPException(status_code=500, detail=f"action item(map-reduce) 생성 실패: {e}")
+                raise HTTPException(status_code=500, detail=f"action item(map-reduce with RunPod) 생성 실패: {e}")
             t_action_end = time.perf_counter()
             action_time = t_action_end - t_action_start
-            logger.info(f"[STEP 4] action items(map-reduce) 생성 완료 (소요={action_time:.2f}s, 누적={t_action_end-t0:.2f}s)")
+            logger.info(f"[STEP 4] action items(map-reduce with RunPod) 생성 완료 (소요={action_time:.2f}s, 누적={t_action_end-t0:.2f}s)")
 
             # Step 5. PDF 생성 (기존 로직 + 메트릭)
             ts = int(time.time())
